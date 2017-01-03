@@ -133,7 +133,7 @@ function Compiler(option){
 	this.$customs = option.customs || {};
 	//监听变更统一回调
 	this.$unifyCb = isFunc(watchAll) ? makeUnifyCallback(watchAll, this.$context) : null;
-	
+
 	//是否立刻编译根元素
 	if(!option.lazy){
 		this.mount();
@@ -142,27 +142,250 @@ function Compiler(option){
 
 let cp = Compiler.prototype;
 
+/**
+ * 挂载/编译根元素
+ */
+cp.mount = function(){
+	this.$done = false;
+	this.$fragment = nodeToFragment(this.$element);
+	this.compile(this.$fragment, true);
+}
+
+/**
+ * 收集节点所有需要编译的指令
+ * 并在收集完成后编译指令队列
+ * @param  {Element} element [编译节点]
+ * @param  {Boolean} root    [是否根节点]
+ * @param  {Object} scope   [vfor取值域]
+ * @param  {Boolean} once    [是否只渲染首次]
+ */
+cp.compile = function(element, root, scope, once){
+	let children = element.childNodes;
+	let parentOnce = !!once || isOnceNode(element);
+
+	if(root && hasDirective(element)){
+		this.$queue.push([element, scope]);
+	}
+
+	def(element, '__vonce__', parentOnce);
+
+	for(let i=0; i<children.length; i++){
+		let node = children[i];
+		let nodeType = node.nodeType;
+
+		//指令只能应用在文本或元素节点
+		if(nodeType !== 1 && nodeType !== 3){
+			continue;
+		}
+
+		let selfOnce = parentOnce || isOnceNode(node);
+
+		if(hasDirective(node)){
+			this.$queue.push([node, scope]);
+			def(node, '__vonce__', selfOnce);
+		}
+
+		if(node.hasChildNodes() && !hasLateCompileChilds(node)){
+			this.compile(node, false, scope, selfOnce);
+		}
+	}
+
+	if(root){
+		this.compileAll();
+	}
+}
+
+/**
+ * 编译节点缓存队列
+ */
+cp.compileAll = function(){
+	each(this.$queue, function (tuple){
+		this.compileNode(tuple);
+		return null;
+	}, this);
+
+	this.completed();
+}
 
 
+cp.compileNode = function(tuple){
+	let node = tuple[0];
+	let scope = tuple[1];
+
+	if(isElement(node)){
+		let vfor, attrs = [];
+		let hasModel, hasBind, index;
+		let nodeAttrs = node.attributes;
+
+		for(let i=0; i<nodeAttrs.length; i++){
+			let attr = nodeAttrs[i];
+			let name = attr.name;
+
+			//收集合法指令
+			if(isDirective(name)){
+				if(name === 'v-for'){
+					vfor = attr;
+				}else if(name === 'v-model'){
+					hasModel = true;
+					index = attrs.length;
+				}else if(name.indexOf('v-bind') === 0){
+					hasBind = true;
+				}else if(name.indexOf('v-hook') === 0){
+					saveDirectiveHooks(node);
+				}
+
+				attrs.push(attr);
+			}
+		}
+
+		//当v-bind 和 v-model共存时， 即使 v-model写在v-bind后面
+		//在IE9+ 和 Edge 中遍历 attributes 时 v-model仍然会先于 v-bind 
+		//所以当二者共存时，v-model 需要放到最后编译以保证表单value的正常获取
+		if(
+			!vfor &&
+			hasBind &&
+			hasModel &&
+			attrs.length > 1 &&
+			(index !== attrs.length - 1)
+		){
+			let vmodel = attrs.splice(index, 1)[0];
+			attrs.push(vmodel);
+			vmodel = null;
+		}
+
+		//vfor 指令与其它指令共存时只需编译 vfor
+		if(vfor){
+			def(node, '__dirs__', attrs.length);
+			attrs = [vfor];
+			vfor = null;
+		}
+
+		//解析节点指令
+		each(attrs, function (attribute){
+			this.parse(node, attribute, scope);
+		}, this);
+
+	}else if(isTextNode(node)){
+		this.parseText(node, scope);
+	}
+}
+
+/**
+ * 解析元素节点指令
+ * @param  {Element} node  [description]
+ * @param  {Object} attr  [description]
+ * @param  {Object} scope [description]
+ */
+cp.parse = function(node, attr, scope){
+	let once = node.__vonce__;
+	let desc = getDirectiveDesc(attr);
+	let directive = desc.directive;
+
+	let dir = 'v' + directive.substr(2);
+	let Parser = DirectiveParsers[dir];
+
+	//移除指令标记
+	removeAttr(node, desc.attr);
+
+	//不需要实例化解析的指令
+	if(noNeedParsers.indexOf(dir) > -1){
+		return;
+	}
+
+	if(Parser){
+		desc.once = once;
+		let dirParser = new Parser(this, node, desc, scope);
+
+		if(once){
+			dirParser.destroy();
+		}else if(!scope){
+			this.$directive.push(dirParser);
+		}
+	}else{
+		warn('[' + directive + '] is an unkown directive');
+	}
+}
 
 
+cp.parseText = function(node, scope){
+	let tokens = [], desc = {};
+	let once = node.parentNode && node.parentNode.__vonce__;
+	let text = node.textContent.trim().replace(regNewline, '');
+
+	let pieces = text.split(regText);
+	let matches = text.match(regText);
+
+	//文本节点转化为常量和变量的组合表达式
+	//'a {{b}} c' => '"a " + b + " c"'
+	each(pieces, function (piece){
+		if(matches.indexOf('{{' + piece + '}}') > -1){
+			tokens.push('(' + piece + ')');
+		}else if(piece){
+			tokens.push('"' + piece + '"');
+		}
+	});
+
+	desc.once = once;
+	desc.expression = tokens.join('+');
+
+	let directive = new DirectiveParsers.vtext(this, node, desc, scope);
+
+	if(once){
+		directive.destroy();
+	}else if(!scope){
+		this.$directive.push(directive);
+	}
+}
+
+/**
+ * 停止编译节点的剩余指令
+ * 如含有其它指令的vfor 节点
+ * 应保留指令信息并放到循环列表中编译
+ * @param  {Element} node [description]
+ */
+cp.block = function(node){
+	each(this.$queue, function (tuple){
+		if(node === tuple[0]){
+			return null;
+		}
+	});
+}
+
+/**
+ * 添加编译完成后的回调函数
+ * @param  {Function} callback
+ * @param  {Object}   context 
+ */
+cp.after = function(callback, context){
+	this.$afters.push([callback, context]);
+}
+
+/**
+ * 检查根节点是否编译完成
+ * @return {[type]} [description]
+ */
+cp.completed = function(){
+	if(this.$queue.length === 0 && !this.$done){
+		this.$done = true;
+		this.$element.appendChild(this.$fragment);
+
+		//触发编译完成后的回调函数
+		each(this.$afters, function (after){
+			after[0].call(after[1]);
+			return null;
+		})
+	}
+}
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+cp.destroy = function(){
+	this.$data = null;
+	empty(this.$element);
+	each(this.$directives, function (directive){
+		directive.destroy();
+		return null;
+	})
+}
 
 
 
