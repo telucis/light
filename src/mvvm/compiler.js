@@ -115,7 +115,7 @@ function Compiler(option){
 	//DOM注册索引
 	this.$regEles = {};
 	//指令实例缓存
-	this.$directive = [];
+	this.$directives = [];
 	//钩子和统一回调作用域
 	this.$context = option.context || this;
 
@@ -129,10 +129,11 @@ function Compiler(option){
 	this.$afters = [];
 	//v-if, v-for DOM 插删钩子函数
 	this.$hooks = option.hooks || {};
-	//自定义指令刷新函数
+	//自定义1指令刷新函数
 	this.$customs = option.customs || {};
 	//监听变更统一回调
 	this.$unifyCb = isFunc(watchAll) ? makeUnifyCallback(watchAll, this.$context) : null;
+	
 	//是否立刻编译根元素
 	if(!option.lazy){
 		this.mount();
